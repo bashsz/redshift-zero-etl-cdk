@@ -6,11 +6,15 @@ import aws_cdk.aws_kinesis as kinesis
 import aws_cdk.aws_rds as rds
 import aws_cdk.aws_redshift as redshift
 import aws_cdk.aws_redshiftserverless as redshiftserverless
-
+import aws_cdk.aws_lambda as _lambda
+import aws_cdk.aws_logs as logs
 from constructs import Construct
+import aws_cdk.aws_cloudformation as cfn
+from aws_cdk.custom_resources import Provider
+from aws_cdk.aws_logs import RetentionDays
 
 
-class DataFederateStack(cdk.Stack):
+class DataFederateStack(Stack):
 
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -50,7 +54,7 @@ class DataFederateStack(cdk.Stack):
 
         # Create private subnets  
         private_subnets = ec2.SubnetConfiguration(
-            subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
+            subnet_type=ec2.SubnetType.PRIVATE_WITH_NAT,
             name="Private", 
             cidr_mask=24
         )
@@ -143,7 +147,11 @@ class DataFederateStack(cdk.Stack):
           ],
         )
 
-        parameter_group=rds.ParameterGroup.from_parameter_group_name(self, "ParameterGroup", "default.aurora-mysql5.7")
+        parameter_group = rds.ParameterGroup(self, "ParameterGroup",
+            engine=rds.DatabaseClusterEngine.aurora_mysql(
+                version=rds.AuroraMysqlEngineVersion.VER_3_05_1
+            )  
+        )
         parameter_group.add_parameter("time_zone", "UTC")
         parameter_group.add_parameter("aws_default_s3_role", rds_role.role_arn)
         parameter_group.add_parameter("aurora_enhanced_binlog", "1")
@@ -153,16 +161,16 @@ class DataFederateStack(cdk.Stack):
         parameter_group.add_parameter("binlog_row_image", "full")
         parameter_group.add_parameter("binlog_row_metadata", "full")
 
-
-        database = rds.ServerlessCluster(
+        database = rds.DatabaseCluster(
             self,
             "RDSCluster",
             default_database_name=f"""{self.stack_name}""",
-            engine=rds.DatabaseClusterEngine.AURORA_MYSQL,
+            engine=rds.DatabaseClusterEngine.aurora_mysql(version=rds.AuroraMysqlEngineVersion.VER_3_05_1),
             vpc=vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
             deletion_protection=False,
-            backup_retention=Duration.days(30),
+            cloudwatch_logs_retention=RetentionDays.ONE_MONTH,
+            storage_type=rds.DBClusterStorageType.AURORA_IOPT1,
             removal_policy=RemovalPolicy.DESTROY,
             credentials=rds.Credentials.from_password(
                 username=props['adminUsername'],
@@ -170,22 +178,22 @@ class DataFederateStack(cdk.Stack):
             ),
             parameter_group=parameter_group,
             security_groups=[aurora_sg],
+            writer=rds.ClusterInstance.provisioned("writer", publicly_accessible=False, 
+                instance_type=ec2.InstanceType.of(ec2.InstanceClass.R5, ec2.InstanceSize.LARGE)
+            ),
+            readers=[
+                rds.ClusterInstance.provisioned(
+                    "reader1", publicly_accessible=False, instance_type=ec2.InstanceType.of(
+                        ec2.InstanceClass.R5, ec2.InstanceSize.LARGE
+                    )
+                )
+            ],
         )
 
-    
 
-        # cluster_subnet_group = redshift_alpha.ClusterSubnetGroup(self, "RedshiftClusterSubnetGroup",
-        #     description="Redshift Cluster subnet group",
-        #     vpc=vpc,
-        #     # the properties below are optional
-        #     removal_policy=cdk.RemovalPolicy.DESTROY,
-        #     vpc_subnets=ec2.SubnetSelection(
-        #         availability_zones=["availabilityZones"],
-        #         one_per_az=False,
-        #         subnet_group_name="redshiftSubnetGroupName",
-        #         subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
-        #     )
-        # )
+        db_cluster_arn = "arn:aws:rds:{}:{}:cluster:{}".format(
+            self.region, self.account, database.cluster_identifier
+        )
 
         redshiftClusterSubnetGroup = redshift.CfnClusterSubnetGroup(self, 'RedshiftClusterSubnetGroup',
             description = 'Cluster subnet group',
@@ -234,8 +242,66 @@ class DataFederateStack(cdk.Stack):
             )],
         )
 
+
+        # Lambda Function
+        custom_resource_lambda = _lambda.Function(
+            self, "CustomResourceLambda",
+            runtime=_lambda.Runtime.PYTHON_3_12,
+            handler="custom_resource.handler",
+            code=_lambda.Code.from_asset("lambda"),
+            timeout=Duration.seconds(300),  # Adjust timeout as needed
+            log_retention=logs.RetentionDays.ONE_WEEK,  # Adjust retention as needed
+            initial_policy=[
+                iam.PolicyStatement(
+                    actions=["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+                    resources=["*"]
+                )
+            ],
+            environment={
+                "VPC_ID": vpc.vpc_id,
+                # Pass any other parameters as needed
+            }
+        )
+
+        # Grant necessary permissions to the Lambda function
+        custom_resource_lambda.add_to_role_policy(
+            statement=iam.PolicyStatement(
+                actions=[
+                    "cloudformation:DescribeStacks",
+                    "cloudformation:DescribeStackEvents",
+                    "cloudformation:DescribeStackResource",
+                    "cloudformation:DescribeStackResources",
+                    "cloudformation:GetTemplate",
+                    "cloudformation:ListStackResources",
+                    "cloudformation:SignalResource",
+                    "cloudformation:UpdateStack",
+                    "redshift:*",
+                    "rds:*"
+                ],
+                resources=["*"]
+            )
+        )
+
+        custom_resource_lambda.node.add_dependency(redshift_wg)
+        custom_resource_lambda.node.add_dependency(database)
+
+        provider = Provider(scope=self, 
+                            id=f'{id}Provider', 
+                            on_event_handler=custom_resource_lambda)
+        
+        cdk.CustomResource(scope=self,
+            id=f'{id}ZeroETLHandler',
+            service_token=provider.service_token,
+            removal_policy=RemovalPolicy.DESTROY,
+            resource_type="Custom::ZeroETLHandler",
+            properties={
+                "source_arn_value":  db_cluster_arn,
+                "target_arn_value":  redshift_ns.attr_namespace_namespace_arn
+            },)
+
+        
         # # Outputs
-        # self.output_redshift_endpoint = redshift_wg.endpoint_address
-        # self.output_kinesis_stream_name = kinesis_stream.stream_name
-        # self.output_aurora_cluster_endpoint = aurora_cluster.cluster_endpoint.hostname
+        self.output_redshift_endpoint = redshift_wg.attr_workgroup_endpoint_address
+        self.output_kinesis_stream_name = kinesis_stream.stream_name
+        self.output_aurora_cluster_endpoint = database.cluster_endpoint.hostname
 
