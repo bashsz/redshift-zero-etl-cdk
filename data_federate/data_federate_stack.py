@@ -1,15 +1,19 @@
-from aws_cdk import Duration, RemovalPolicy, Stack
+
 import aws_cdk as cdk
-import aws_cdk.aws_ec2 as ec2
-import aws_cdk.aws_iam as iam
-import aws_cdk.aws_kinesis as kinesis
-import aws_cdk.aws_rds as rds
-import aws_cdk.aws_redshift as redshift
-import aws_cdk.aws_redshiftserverless as redshiftserverless
-import aws_cdk.aws_lambda as _lambda
-import aws_cdk.aws_logs as logs
+
+from aws_cdk import (
+    CfnOutput,
+    aws_ec2 as ec2,
+    aws_iam as iam,
+    aws_kinesis as kinesis,
+    aws_rds as rds,
+    aws_redshift as redshift,
+    aws_redshiftserverless as redshiftserverless,
+    aws_lambda as _lambda,
+    aws_logs as logs,
+    Duration, RemovalPolicy, Stack
+)
 from constructs import Construct
-import aws_cdk.aws_cloudformation as cfn
 from aws_cdk.custom_resources import Provider
 from aws_cdk.aws_logs import RetentionDays
 
@@ -300,8 +304,6 @@ class DataFederateStack(Stack):
             },)
 
         
-        # # Outputs
-        self.output_redshift_endpoint = redshift_wg.attr_workgroup_endpoint_address
-        self.output_kinesis_stream_name = kinesis_stream.stream_name
-        self.output_aurora_cluster_endpoint = database.cluster_endpoint.hostname
-
+        CfnOutput(self, "RedshiftEndpoint", value=redshift_wg.attr_workgroup_endpoint_address)
+        CfnOutput(self, "KinesisStream", value=kinesis_stream.stream_name)
+        CfnOutput(self, "RDSEndpoint", value=database.cluster_endpoint.hostname)
